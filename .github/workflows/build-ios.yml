@@ -1,0 +1,161 @@
+name: Build iOS App (SFI)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-ios:
+    name: Build SFI for iOS
+    runs-on: macos-15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1.6.0
+        with:
+          xcode-version: latest-stable
+
+      - name: Display Xcode version
+        run: xcodebuild -version
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      # --- Получаем SHA ТОЛЬКО из main ---
+      - name: Get sing-box version
+        id: singbox
+        run: |
+          set -e
+
+          for i in 1 2 3; do
+            SHA=$(git ls-remote https://github.com/SagerNet/sing-box.git refs/heads/main | cut -f1)
+            [ -n "$SHA" ] && break
+            echo "Retry $i..."
+            sleep 2
+          done
+
+          if [ -z "$SHA" ]; then
+            echo "Error: failed to fetch SHA"
+            exit 1
+          fi
+
+          echo "sha=${SHA:0:8}" >> $GITHUB_OUTPUT
+          echo "Using sing-box commit: ${SHA:0:8}"
+
+      # --- Кеш xcframework ---
+      - name: Cache Libbox.xcframework
+        id: cache-libbox
+        uses: actions/cache@v4
+        with:
+          path: Libbox.xcframework
+          key: libbox-${{ runner.os }}-go1.23-${{ steps.singbox.outputs.sha }}
+          restore-keys: |
+            libbox-${{ runner.os }}-
+
+      # --- Сборка libbox ---
+      - name: Build Libbox.xcframework
+        if: steps.cache-libbox.outputs.cache-hit != 'true'
+        run: |
+          set -e
+
+          git clone https://github.com/SagerNet/sing-box.git /tmp/sing-box
+          cd /tmp/sing-box
+          git checkout ${{ steps.singbox.outputs.sha }}
+
+          export PATH="$(go env GOPATH)/bin:$PATH"
+
+          go install github.com/sagernet/gomobile/cmd/gomobile@v0.1.11
+          go install github.com/sagernet/gomobile/cmd/gobind@v0.1.11
+
+          gomobile init
+
+          go run ./cmd/internal/build_libbox -target apple -platform ios,iossimulator
+
+          cp -R Libbox.xcframework "$GITHUB_WORKSPACE/"
+
+      - name: Verify Libbox
+        run: |
+          test -d Libbox.xcframework || (echo "Libbox missing" && exit 1)
+
+      - name: Create build dir
+        run: mkdir -p build
+
+      # --- Кеш archive ---
+      - name: Cache xcarchive
+        id: cache-archive
+        uses: actions/cache@v4
+        with:
+          path: build/SFI.xcarchive
+          key: archive-${{ runner.os }}-${{ hashFiles('**/*.swift', '**/*.m', '**/*.h', '*.xcodeproj/**', 'Libbox.xcframework/**') }}
+          restore-keys: |
+            archive-${{ runner.os }}-
+
+      # --- Сборка приложения ---
+      - name: Archive app
+        if: steps.cache-archive.outputs.cache-hit != 'true'
+        run: |
+          set -e
+
+          xcodebuild archive \
+            -scheme SFI \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/SFI.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_STYLE=Manual
+
+      # --- Упаковка IPA ---
+      - name: Create unsigned IPA
+        run: |
+          set -e
+
+          APP=$(find build/SFI.xcarchive/Products/Applications -name "*.app" | head -n 1)
+
+          if [ -z "$APP" ]; then
+            echo "App not found"
+            exit 1
+          fi
+
+          mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+
+          cd build/ipa
+          zip -r SFI-${{ steps.singbox.outputs.sha }}-unsigned.ipa Payload
+
+      # --- Артефакты ---
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SFI-unsigned
+          path: build/ipa/*.ipa
+          retention-days: 30
+
+      - name: Upload xcarchive
+        uses: actions/upload-artifact@v4
+        with:
+          name: SFI-xcarchive
+          path: build/SFI.xcarchive
+          retention-days: 7
+
+      - name: Done
+        run: |
+          echo "Build completed"
+          ls -lh build/ipa/
